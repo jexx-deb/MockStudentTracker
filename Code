@@ -1,28 +1,42 @@
-import json
+import sqlite3
 import os
 
-DATA_FILE = "students.json"
+DB_FILE = "students.db"
 
 
 # =========================
-# FILE HANDLING
+# DATABASE SETUP
 # =========================
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as file:
-                return json.load(file)
-        except json.JSONDecodeError:
-            print("⚠ Corrupted data file detected.")
-            return {}
-    return {}
+def get_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
-    print("✔ Data saved successfully.")
+def init_db():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS grades (
+            student_id TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            grade REAL NOT NULL,
+            PRIMARY KEY (student_id, subject),
+            FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
+        )
+    """)
+
+    conn.commit()
+    conn.close()
 
 
 # =========================
@@ -33,12 +47,16 @@ def divider():
     print("─" * 50)
 
 
-def generate_id(data):
-    if not data:
-        return "S001"
+def generate_id(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM students")
+    ids = [row[0] for row in cur.fetchall()]
 
-    last_id = max(int(student_id[1:]) for student_id in data.keys())
-    return f"S{last_id + 1:03d}"
+    if not ids:
+        return "N001"
+
+    last_id = max(int(sid[1:]) for sid in ids)
+    return f"N{last_id + 1:03d}"
 
 
 def get_average(grades):
@@ -48,7 +66,9 @@ def get_average(grades):
 
 
 def get_letter_grade(avg):
-    if avg >= 90:
+    if avg >= 100:
+        return "Outstanding"
+    elif avg >= 90:
         return "Excellent"
     elif avg >= 80:
         return "Good"
@@ -59,11 +79,26 @@ def get_letter_grade(avg):
     return "Failing"
 
 
+def fetch_student_grades(conn, student_id):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT subject, grade FROM grades WHERE student_id = ?",
+        (student_id,)
+    )
+    return {subject: grade for subject, grade in cur.fetchall()}
+
+
+def student_exists(conn, student_id):
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM students WHERE id = ?", (student_id,))
+    return cur.fetchone() is not None
+
+
 # =========================
 # STUDENT FUNCTIONS
 # =========================
 
-def add_student(data):
+def add_student(conn):
     divider()
     print("ADD STUDENT")
     divider()
@@ -74,30 +109,36 @@ def add_student(data):
         print("✘ Name cannot be empty.")
         return
 
-    for sid, info in data.items():
-        if info["name"].lower() == name.lower():
-            print(f"✘ Student already exists with ID {sid}")
-            return
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM students WHERE LOWER(name) = LOWER(?)",
+        (name,)
+    )
+    existing = cur.fetchone()
 
-    student_id = generate_id(data)
+    if existing:
+        print(f"✘ Student already exists with ID {existing[0]}")
+        return
 
-    data[student_id] = {
-        "name": name,
-        "grades": {}
-    }
+    student_id = generate_id(conn)
 
-    save_data(data)
+    cur.execute(
+        "INSERT INTO students (id, name) VALUES (?, ?)",
+        (student_id, name)
+    )
+    conn.commit()
+
     print(f"✔ Student added successfully. ID: {student_id}")
 
 
-def edit_student_name(data):
+def edit_student_name(conn):
     divider()
     print("EDIT STUDENT NAME")
     divider()
 
     student_id = input("Enter Student ID: ").strip().upper()
 
-    if student_id not in data:
+    if not student_exists(conn, student_id):
         print("✘ Student not found.")
         return
 
@@ -107,28 +148,33 @@ def edit_student_name(data):
         print("✘ Name cannot be empty.")
         return
 
-    data[student_id]["name"] = new_name
-    save_data(data)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE students SET name = ? WHERE id = ?",
+        (new_name, student_id)
+    )
+    conn.commit()
 
     print("✔ Student name updated.")
 
 
-def delete_student(data):
+def delete_student(conn):
     divider()
     print("DELETE STUDENT")
     divider()
 
     student_id = input("Enter Student ID: ").strip().upper()
 
-    if student_id not in data:
+    if not student_exists(conn, student_id):
         print("✘ Student not found.")
         return
 
     confirm = input("Type YES to confirm: ").upper()
 
     if confirm == "YES":
-        del data[student_id]
-        save_data(data)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM students WHERE id = ?", (student_id,))
+        conn.commit()
         print("✔ Student deleted.")
     else:
         print("Cancelled.")
@@ -138,14 +184,14 @@ def delete_student(data):
 # GRADE FUNCTIONS
 # =========================
 
-def add_grade(data):
+def add_grade(conn):
     divider()
     print("ADD / UPDATE GRADE")
     divider()
 
     student_id = input("Enter Student ID: ").strip().upper()
 
-    if student_id not in data:
+    if not student_exists(conn, student_id):
         print("✘ Student not found.")
         return
 
@@ -161,25 +207,29 @@ def add_grade(data):
         print("✘ Grade must be between 0 and 100.")
         return
 
-    data[student_id]["grades"][subject] = grade
-
-    save_data(data)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO grades (student_id, subject, grade)
+        VALUES (?, ?, ?)
+        ON CONFLICT(student_id, subject) DO UPDATE SET grade = excluded.grade
+    """, (student_id, subject, grade))
+    conn.commit()
 
     print("✔ Grade saved.")
 
 
-def delete_grade(data):
+def delete_grade(conn):
     divider()
     print("DELETE GRADE")
     divider()
 
     student_id = input("Enter Student ID: ").strip().upper()
 
-    if student_id not in data:
+    if not student_exists(conn, student_id):
         print("✘ Student not found.")
         return
 
-    grades = data[student_id]["grades"]
+    grades = fetch_student_grades(conn, student_id)
 
     if not grades:
         print("No grades recorded.")
@@ -191,9 +241,12 @@ def delete_grade(data):
         print("✘ Subject not found.")
         return
 
-    del grades[subject]
-
-    save_data(data)
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM grades WHERE student_id = ? AND subject = ?",
+        (student_id, subject)
+    )
+    conn.commit()
 
     print("✔ Grade deleted.")
 
@@ -202,32 +255,32 @@ def delete_grade(data):
 # REPORTS
 # =========================
 
-def view_student_report(data):
+def view_student_report(conn):
     divider()
     print("STUDENT REPORT")
     divider()
 
     student_id = input("Enter Student ID: ").strip().upper()
 
-    if student_id not in data:
+    if not student_exists(conn, student_id):
         print("✘ Student not found.")
         return
 
-    student = data[student_id]
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM students WHERE id = ?", (student_id,))
+    name = cur.fetchone()[0]
 
-    print(f"\nName : {student['name']}")
+    print(f"\nName : {name}")
     print(f"ID   : {student_id}")
 
-    grades = student["grades"]
+    grades = fetch_student_grades(conn, student_id)
 
     if not grades:
         print("\nNo grades available.")
         return
 
     divider()
-
     print(f"{'Subject':20} {'Grade':>10}")
-
     divider()
 
     for subject, grade in grades.items():
@@ -236,83 +289,82 @@ def view_student_report(data):
     avg = get_average(grades)
 
     divider()
-
     print(f"Average: {avg:.2f}")
     print(f"Letter : {get_letter_grade(avg)}")
 
 
-def list_students(data):
+def list_students(conn):
     divider()
     print("ALL STUDENTS")
     divider()
 
-    if not data:
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM students ORDER BY id")
+    students = cur.fetchall()
+
+    if not students:
         print("No students registered.")
         return
 
     print(f"{'ID':<8}{'NAME':<25}{'AVG':<10}{'GRADE'}")
-
     divider()
 
-    for sid, info in sorted(data.items()):
-        avg = get_average(info["grades"])
+    for sid, name in students:
+        grades = fetch_student_grades(conn, sid)
 
-        if info["grades"]:
+        if grades:
+            avg = get_average(grades)
             grade_letter = get_letter_grade(avg)
             avg_display = f"{avg:.2f}"
         else:
             avg_display = "-"
             grade_letter = "N/A"
 
-        print(
-            f"{sid:<8}"
-            f"{info['name']:<25}"
-            f"{avg_display:<10}"
-            f"{grade_letter}"
-        )
+        print(f"{sid:<8}{name:<25}{avg_display:<10}{grade_letter}")
 
 
-def search_student(data):
+def search_student(conn):
     divider()
     print("SEARCH STUDENT")
     divider()
 
-    keyword = input("Enter student name: ").lower()
+    keyword = input("Enter student name: ").strip()
 
-    found = False
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, name FROM students WHERE LOWER(name) LIKE LOWER(?)",
+        (f"%{keyword}%",)
+    )
+    results = cur.fetchall()
 
-    for sid, info in data.items():
-        if keyword in info["name"].lower():
-            print(f"{sid} - {info['name']}")
-            found = True
-
-    if not found:
+    if not results:
         print("No matching student found.")
+        return
+
+    for sid, name in results:
+        print(f"{sid} - {name}")
 
 
-def top_student(data):
+def top_student(conn):
     divider()
     print("TOP PERFORMING STUDENT")
     divider()
 
-    ranked = []
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM students")
+    students = cur.fetchall()
 
-    for sid, info in data.items():
-        if info["grades"]:
-            ranked.append(
-                (
-                    get_average(info["grades"]),
-                    sid,
-                    info["name"]
-                )
-            )
+    ranked = []
+    for sid, name in students:
+        grades = fetch_student_grades(conn, sid)
+        if grades:
+            ranked.append((get_average(grades), sid, name))
 
     if not ranked:
         print("No grades available.")
         return
 
     ranked.sort(reverse=True)
-
     avg, sid, name = ranked[0]
 
     print(f"Name    : {name}")
@@ -321,17 +373,20 @@ def top_student(data):
     print(f"Grade   : {get_letter_grade(avg)}")
 
 
-def ranking_system(data):
+def ranking_system(conn):
     divider()
     print("CLASS RANKING")
     divider()
 
-    ranked = []
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM students")
+    students = cur.fetchall()
 
-    for sid, info in data.items():
-        if info["grades"]:
-            avg = get_average(info["grades"])
-            ranked.append((avg, sid, info["name"]))
+    ranked = []
+    for sid, name in students:
+        grades = fetch_student_grades(conn, sid)
+        if grades:
+            ranked.append((get_average(grades), sid, name))
 
     if not ranked:
         print("No grades available.")
@@ -346,18 +401,20 @@ def ranking_system(data):
         print(f"{rank:<6}{sid:<8}{name:<25}{avg:.2f}")
 
 
-def class_statistics(data):
+def class_statistics(conn):
     divider()
     print("CLASS STATISTICS")
     divider()
 
-    averages = []
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM students")
+    student_ids = [row[0] for row in cur.fetchall()]
 
-    for info in data.values():
-        if info["grades"]:
-            averages.append(
-                get_average(info["grades"])
-            )
+    averages = []
+    for sid in student_ids:
+        grades = fetch_student_grades(conn, sid)
+        if grades:
+            averages.append(get_average(grades))
 
     if not averages:
         print("No grades available.")
@@ -372,25 +429,22 @@ def class_statistics(data):
     print(f"Class Average   : {overall:.2f}")
 
 
-def honor_roll(data):
+def honor_roll(conn):
     divider()
     print("HONOR ROLL")
     divider()
 
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM students")
+    students = cur.fetchall()
+
     found = False
-
-    for sid, info in data.items():
-
-        if info["grades"]:
-
-            avg = get_average(info["grades"])
-
+    for sid, name in students:
+        grades = fetch_student_grades(conn, sid)
+        if grades:
+            avg = get_average(grades)
             if avg >= 90:
-                print(
-                    f"{sid:<8}"
-                    f"{info['name']:<25}"
-                    f"{avg:.2f}"
-                )
+                print(f"{sid:<8}{name:<25}{avg:.2f}")
                 found = True
 
     if not found:
@@ -403,7 +457,7 @@ def honor_roll(data):
 
 def menu():
     print("\n" + "═" * 50)
-    print("     STUDENT GRADE TRACKER v2.0")
+    print("     STUDENT GRADE TRACKER v3.0 (SQLite)")
     print("═" * 50)
 
     print("[1] Add Student")
@@ -428,53 +482,41 @@ def menu():
 # =========================
 
 def main():
-    data = load_data()
+    init_db()
+    conn = get_connection()
 
     while True:
         menu()
-
         choice = input("Choose option: ").strip()
 
         if choice == "1":
-            add_student(data)
-
+            add_student(conn)
         elif choice == "2":
-            add_grade(data)
-
+            add_grade(conn)
         elif choice == "3":
-            view_student_report(data)
-
+            view_student_report(conn)
         elif choice == "4":
-            list_students(data)
-
+            list_students(conn)
         elif choice == "5":
-            delete_student(data)
-
+            delete_student(conn)
         elif choice == "6":
-            search_student(data)
-
+            search_student(conn)
         elif choice == "7":
-            edit_student_name(data)
-
+            edit_student_name(conn)
         elif choice == "8":
-            delete_grade(data)
-
+            delete_grade(conn)
         elif choice == "9":
-            top_student(data)
-
+            top_student(conn)
         elif choice == "10":
-            ranking_system(data)
-
+            ranking_system(conn)
         elif choice == "11":
-            class_statistics(data)
-
+            class_statistics(conn)
         elif choice == "12":
-            honor_roll(data)
-
+            honor_roll(conn)
         elif choice == "0":
             print("\nGoodbye! 👋")
+            conn.close()
             break
-
         else:
             print("✘ Invalid choice.")
 
